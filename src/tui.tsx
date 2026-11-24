@@ -41,6 +41,8 @@
  * OpenCode transpiles the TSX on load and resolves the imports itself.
  */
 import { Plugin } from "@opencode/plugin/tui"
+import { spawn } from "node:child_process"
+import { Buffer } from "node:buffer"
 import { For, Show, createMemo, createSignal, type JSX } from "solid-js"
 import { contextBarWidth, loadConfig, rateOptions, resolvedPadding, segmentsFor, sharesHostRow, stackFor, type Config, type Surface, type UsageSegment } from "./config.ts"
 import { diffDue, diffKey, diffParts, diffTotals, type DiffReading, type DiffStat, type StatusFile } from "./diff.ts"
@@ -74,6 +76,20 @@ import {
 } from "./rate.ts"
 import { cacheRuns, columnWidth, contextRuns, cutRuns, dimRuns, gaugeFor, hostRuns, joinedWidth, muted, wrapRows, type CapInput, type Run, type RunTone } from "./render.ts"
 import { contextUsed, duration, money, shellsLabel, type TokenRecord } from "./format.ts"
+import {
+  SUMMARY_ATTACHMENT_METADATA_KEY,
+  summaryPrompt,
+  summaryTranscript,
+  type SessionSummary,
+  type SummaryAttachment,
+} from "./summary.ts"
+import {
+  PENDING_INSTRUCTIONS_METADATA_KEY,
+  SESSION_INSTRUCTIONS_METADATA_KEY,
+  type InstructionSnapshot,
+  type UserInstruction,
+} from "./instructions.ts"
+import { TOOL_INVENTORY_RPC } from "./tool-inventory-rpc.ts"
 
 /** How often the line redraws while something is on screen. */
 const TICK_MS = 250
@@ -131,6 +147,7 @@ interface Event {
   created?: number
   data?: {
     sessionID?: string
+    server?: string
     assistantMessageID?: string
     delta?: string
     tokens?: Tokens
@@ -186,6 +203,37 @@ export default Plugin.define({
     // stream restarts.
     for (const each of meters.values()) adoptMeter(each)
     const [version, setVersion] = createSignal(0, { equals: false })
+    type SummaryState = { version: 1; entries: Record<string, SessionSummary> }
+    const [summaryState, updateSummaryState] = context.storage.store<SummaryState>("session-summaries", {
+      initial: { version: 1, entries: {} },
+    })
+    const [summaryStatus, setSummaryStatus] = createSignal("idle")
+    const [mcpRecoveryCount, setMcpRecoveryCount] = createSignal(0)
+    const [summarySectionOpen, setSummarySectionOpen] = createSignal(false)
+    const [instructionSectionOpen, setInstructionSectionOpen] = createSignal(false)
+    type ToolInventory = { tools: Array<{ id: string; description: string; schema: string; estimatedTokens: number }>; estimatedTokens: number }
+    const [toolInventory, setToolInventory] = createSignal<ToolInventory>()
+    const [toolInventoryLoading, setToolInventoryLoading] = createSignal(false)
+    const [toolInventoryError, setToolInventoryError] = createSignal(false)
+    type SummaryPickerState = { sessionID: string; entries: SessionSummary[] }
+    type InstructionPickerState = { sessionID: string; entries: UserInstruction[]; mode: "always" | "slash" }
+    const [summaryPicker, setSummaryPicker] = createSignal<SummaryPickerState>()
+    const [summaryPickerCursor, setSummaryPickerCursor] = createSignal(0)
+    const [selectedSummaryIDs, setSelectedSummaryIDs] = createSignal<string[]>([])
+    let summaryDetailScroll: { scrollBy: (delta: number) => void; scrollTo: (position: number) => void } | undefined
+    const [instructionPicker, setInstructionPicker] = createSignal<InstructionPickerState>()
+    const [selectedInstructionIDs, setSelectedInstructionIDs] = createSignal<string[]>([])
+    type InstructionLibraryState = { version: 1; items: UserInstruction[] }
+    const [instructionLibrary, updateInstructionLibrary] = context.storage.store<InstructionLibraryState>("session-instructions", {
+      initial: { version: 1, items: [] },
+    })
+    const summaryStatusText = () =>
+      [
+        mcpRecoveryCount() > 0 ? `MCP reconnecting (${mcpRecoveryCount()})` : undefined,
+        summaryStatus() === "working" ? "Summarizing..." : summaryStatus() === "done" ? "Summary ready" : undefined,
+      ]
+        .filter(Boolean)
+        .join(" | ")
     let timer: ReturnType<typeof setInterval> | undefined
     /** Keeps the elapsed timer and held figures repainting while nothing streams. */
     const heartbeat = setInterval(() => setVersion((value) => value + 1), 1_000)
@@ -305,7 +353,6 @@ export default Plugin.define({
       }
     }
     const startup = context.ui.router.current()
-    if (startup.type === "session") void seedMeter(startup.sessionID)
 
     const onDelta = (source: DeltaSource) => (event: Event) => {
       const data = event?.data
@@ -350,6 +397,17 @@ export default Plugin.define({
     }
 
     const stops = [
+      context.data.on(
+        "mcp.status.changed",
+        safely((event: Event) => {
+          const server = event?.data?.server
+          if (typeof server === "string") {
+            void handleMCPStatus(server).catch((error) =>
+              console.warn("opencode-status-line: could not inspect MCP status", error),
+            )
+          }
+        }),
+      ),
       context.data.on("session.text.delta", safely(onDelta("text"))),
       context.data.on("session.reasoning.delta", safely(onDelta("reasoning"))),
       // Tool arguments stream as visible output tokens too; they count in the
@@ -439,6 +497,7 @@ export default Plugin.define({
         safely((event: Event) => {
           const sessionID = sessionOf(event)
           if (!sessionID) return
+          cancelSummaryTimer(sessionID)
           beginTurn(meter(sessionID), Date.now(), opts)
         }),
       ),
@@ -448,7 +507,19 @@ export default Plugin.define({
       // A late belt for a turn whose execution settlement never arrived: idle
       // closes the fold too, and a second close is a no-op. Without it a turn
       // that ended quietly would bleed into the next one's cumulative figure.
-      context.data.on("session.idle", safely(onTurnEnd)),
+      context.data.on(
+        "session.idle",
+        safely((event: Event) => {
+          onTurnEnd(event)
+          const sessionID = sessionOf(event)
+          if (sessionID) {
+            scheduleIdleSummary(sessionID)
+            void clearPendingInstructions(sessionID).catch((error) =>
+              console.warn("opencode-status-line: could not clear one-prompt instructions", error),
+            )
+          }
+        }),
+      ),
       // A queued prompt is a turn boundary of its own: one execution busy
       // period publishes a single `session.execution.started`, so the host can
       // process several queued prompts under one begin/end pair. Each item's
@@ -550,6 +621,482 @@ export default Plugin.define({
       const route = context.ui.router.current()
       return route.type === "session" ? route.sessionID : undefined
     }
+
+    const openProjectPowerShell = () => {
+      const sessionID = currentSession()
+      const session = sessionID ? context.data.session.get(sessionID) : undefined
+      const directory = session?.location.directory ?? context.location?.directory ?? context.data.location.default()?.directory
+      if (!directory) {
+        context.ui.toast.show({ variant: "warning", message: "Open a project before launching PowerShell." })
+        return
+      }
+      const psQuote = (value: string) => `'${value.replace(/'/g, "''")}'`
+      const childCommand = `Set-Location -LiteralPath ${psQuote(directory)}`
+      // `start` creates a visible console window. Launching a hidden PowerShell
+      // process that itself calls Start-Process can silently leave the user with
+      // only the success toast on Windows Terminal hosts.
+      const encodedCommand = Buffer.from(childCommand, "utf16le").toString("base64")
+      try {
+        const launcher = spawn("cmd.exe", ["/d", "/c", "start", "", "powershell.exe", "-NoLogo", "-NoExit", "-EncodedCommand", encodedCommand], {
+          detached: true,
+          stdio: "ignore",
+          windowsHide: true,
+        })
+        launcher.once("error", (error) => {
+          try {
+            context.ui.toast.show({ variant: "error", title: "Could not open PowerShell", message: error.message })
+          } catch (toastError) {
+            console.warn("opencode-status-line: PowerShell launch notification failed", toastError)
+          }
+        })
+        launcher.once("spawn", () => {
+          launcher.unref()
+          context.ui.toast.show({ variant: "info", title: "PowerShell opened", message: directory })
+        })
+      } catch (error) {
+        context.ui.toast.show({
+          variant: "error",
+          title: "Could not open PowerShell",
+          message: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+
+    const attachSummarySelection = async (): Promise<void> => {
+      const picker = summaryPicker()
+      const chosenIDs = selectedSummaryIDs().length
+        ? selectedSummaryIDs()
+        : picker?.entries[summaryPickerCursor()]
+          ? [picker.entries[summaryPickerCursor()].sessionID]
+          : []
+      const selectedEntries = chosenIDs
+        .map((id) => summaryState.entries[id] ?? picker?.entries.find((entry) => entry.sessionID === id))
+        .filter((entry): entry is SessionSummary => Boolean(entry))
+      if (!picker || !selectedEntries.length) {
+        context.ui.toast.show({ variant: "warning", message: "There are no summaries to attach." })
+        return
+      }
+      const activeInfo = context.data.session.get(picker.sessionID)
+      if (!activeInfo) return
+      const attachments: SummaryAttachment[] = selectedEntries.map(({ sessionID, projectID, title, summary, updatedAt }) => ({
+        sessionID,
+        projectID,
+        title,
+        summary,
+        updatedAt,
+      }))
+      await context.client.session.update({
+        sessionID: picker.sessionID,
+        metadata: { ...activeInfo.metadata, [SUMMARY_ATTACHMENT_METADATA_KEY]: attachments },
+      })
+      setSummaryPicker(undefined)
+      context.ui.dialog.clear()
+      context.ui.toast.show({ variant: "success", message: `${attachments.length} summary context(s) attached to this session.` })
+    }
+
+    const validInstructionSnapshots = (value: unknown): InstructionSnapshot[] =>
+      Array.isArray(value)
+        ? value.filter((entry): entry is InstructionSnapshot => {
+            if (!entry || typeof entry !== "object") return false
+            const item = entry as Record<string, unknown>
+            return (
+              typeof item.id === "string" &&
+              typeof item.title === "string" &&
+              typeof item.prompt === "string" &&
+              (item.mode === "always" || item.mode === "slash")
+            )
+          })
+        : []
+
+    const attachInstructionSelection = async (): Promise<void> => {
+      const picker = instructionPicker()
+      if (!picker) return
+      const selected = selectedInstructionIDs()
+        .map((id) => instructionLibrary.items.find((item) => item.id === id) ?? picker.entries.find((item) => item.id === id))
+        .filter((item): item is UserInstruction => Boolean(item))
+        .map(({ id, title, prompt, mode }) => ({ id, title, prompt, mode }))
+      const activeInfo = context.data.session.get(picker.sessionID)
+      if (!activeInfo) return
+      const key = picker.mode === "always" ? SESSION_INSTRUCTIONS_METADATA_KEY : PENDING_INSTRUCTIONS_METADATA_KEY
+      if (!selected.length) {
+        await context.client.session.update({
+          sessionID: picker.sessionID,
+          metadata: { ...activeInfo.metadata, [key]: [] },
+        })
+        setInstructionPicker(undefined)
+        context.ui.dialog.clear()
+        context.ui.toast.show({
+          variant: "info",
+          message: picker.mode === "always" ? "Always-active instructions cleared for this session." : "Queued instructions cleared.",
+        })
+        return
+      }
+      const metadata = activeInfo.metadata as Record<string, unknown> | undefined
+      const existing = picker.mode === "slash" ? validInstructionSnapshots(metadata?.[key]) : []
+      const combined = [...new Map([...existing, ...selected].map((item) => [item.id, item])).values()]
+      await context.client.session.update({
+        sessionID: picker.sessionID,
+        metadata: { ...activeInfo.metadata, [key]: combined },
+      })
+      setInstructionPicker(undefined)
+      context.ui.dialog.clear()
+      context.ui.toast.show({
+        variant: "success",
+        message:
+          picker.mode === "always"
+            ? `${selected.length} instruction(s) attached to this session.`
+            : `${selected.length} instruction(s) queued for the next prompt.`,
+      })
+    }
+
+    const clearPendingInstructions = async (sessionID: string): Promise<void> => {
+      const session = context.data.session.get(sessionID)
+      if (!session) return
+      const metadata = session.metadata as Record<string, unknown> | undefined
+      if (!validInstructionSnapshots(metadata?.[PENDING_INSTRUCTIONS_METADATA_KEY]).length) return
+      await context.client.session.update({
+        sessionID,
+        metadata: { ...session.metadata, [PENDING_INSTRUCTIONS_METADATA_KEY]: [] },
+      })
+    }
+
+    const SummaryPicker = () => (
+      <Show when={summaryPicker()}>
+        {(state) => (
+          <box flexDirection="column" paddingLeft={2} paddingRight={2} gap={1}>
+            <text>Up/Down browse | Space select/deselect | PgUp/PgDn scroll details | Enter attach | Esc cancel</text>
+            <Show when={state().entries.length === 1}>
+              <text>Only one summary is saved. Create summaries in other sessions with /summary to add choices.</text>
+            </Show>
+            <box flexDirection="column" border borderStyle="single" title="Saved summaries" paddingLeft={1} paddingRight={1}>
+              <For each={state().entries}>
+                {(entry, index) => (
+                  <text wrapMode="none">
+                    {index() === summaryPickerCursor() ? "> " : "  "}
+                    {selectedSummaryIDs().includes(entry.sessionID) ? "[x] " : "[ ] "}
+                    {entry.title}
+                  </text>
+                )}
+              </For>
+            </box>
+            <Show when={state().entries[summaryPickerCursor()]}>
+              {(entry) => (
+                <box flexDirection="column" border borderStyle="single" title="Selected summary - full details" paddingLeft={1} paddingRight={1}>
+                  <text wrapMode="none">{entry().title} | Updated {new Date(entry().updatedAt).toLocaleString("id-ID")}</text>
+                  <scrollbox height={18} ref={(el) => { summaryDetailScroll = el }}>
+                    <text>{entry().summary}</text>
+                  </scrollbox>
+                </box>
+              )}
+            </Show>
+            <text>{selectedSummaryIDs().length || (state().entries.length ? 1 : 0)} selected | Enter attaches the highlighted item if none are checked</text>
+          </box>
+        )}
+      </Show>
+    )
+
+    const InstructionPicker = () => (
+      <Show when={instructionPicker()}>
+        {(state) => (
+          <box flexDirection="column" paddingLeft={2} paddingRight={2} gap={1}>
+            <text>
+              {state().mode === "always"
+                ? "Choose instructions for every prompt in this session."
+                : "Choose instructions to apply to the next prompt only."}
+              {" Use Space to select, Enter to apply, and Esc to cancel."}
+            </text>
+            <For each={state().entries}>
+              {(entry, index) => (
+                <box flexDirection="column" paddingTop={index() === summaryPickerCursor() ? 1 : 0}>
+                  <text wrapMode="none">
+                    {index() === summaryPickerCursor() ? "› " : "  "}
+                    {selectedInstructionIDs().includes(entry.id) ? "[x] " : "[ ] "}
+                    {entry.title}
+                  </text>
+                  <Show when={index() === summaryPickerCursor()}>
+                    <text>{entry.prompt}</text>
+                  </Show>
+                </box>
+              )}
+            </For>
+            <text>{selectedInstructionIDs().length} selected</text>
+          </box>
+        )}
+      </Show>
+    )
+
+    const openInstructionPicker = (mode: "always" | "slash") => {
+      const sessionID = currentSession()
+      if (!sessionID) {
+        context.ui.toast.show({ variant: "warning", message: "Open a session before choosing instructions." })
+        return
+      }
+      const session = context.data.session.get(sessionID)
+      const metadata = session?.metadata as Record<string, unknown> | undefined
+      const key = mode === "always" ? SESSION_INSTRUCTIONS_METADATA_KEY : PENDING_INSTRUCTIONS_METADATA_KEY
+      const selected = validInstructionSnapshots(metadata?.[key])
+      const enabledItems = instructionLibrary.items.filter((item) => item.enabled && item.mode === mode)
+      const previous = selected.map((snapshot) => instructionLibrary.items.find((item) => item.id === snapshot.id) ?? {
+        ...snapshot,
+        enabled: false,
+        createdAt: 0,
+      })
+      const ids = new Set(enabledItems.map((item) => item.id))
+      const entries = [...enabledItems, ...previous.filter((item) => !ids.has(item.id))]
+      if (!entries.length) {
+        context.ui.toast.show({
+          variant: "info",
+          message: mode === "always" ? "No always-active instructions. Use /instruction-add first." : "No slash-triggered instructions. Use /instruction-add first.",
+        })
+        return
+      }
+      setSummaryPicker(undefined)
+      setSummaryPickerCursor(0)
+      setInstructionPicker({ sessionID, entries, mode })
+      setSelectedInstructionIDs(selected.map((item) => item.id))
+      context.ui.dialog.set({ size: "xlarge" })
+      context.ui.dialog.show(() => <InstructionPicker />)
+    }
+
+    const addInstruction = async () => {
+      const title = (await context.ui.dialog.prompt({ title: "New instruction", placeholder: "Short name" }))?.trim()
+      if (!title) return
+      const prompt = (await context.ui.dialog.prompt({
+        title: "Instruction text",
+        description: "What should the agent do? This is stored in your local OpenCode plugin data.",
+        placeholder: "Write the instruction",
+      }))?.trim()
+      if (!prompt) return
+      const mode = await context.ui.dialog.select({
+        title: "When should this instruction apply?",
+        options: [
+          { title: "Always in selected sessions", value: "always" as const },
+          { title: "Only when triggered with /instruction", value: "slash" as const },
+        ],
+      })
+      if (!mode) return
+      const item: UserInstruction = {
+        id: crypto.randomUUID(),
+        title,
+        prompt,
+        mode,
+        enabled: true,
+        createdAt: Date.now(),
+      }
+      await updateInstructionLibrary((draft) => {
+        draft.items.push(item)
+      })
+      context.ui.toast.show({ variant: "success", message: `Saved instruction: ${title}` })
+    }
+
+    const toggleInstruction = async () => {
+      const item = await context.ui.dialog.select({
+        title: "Enable or disable an instruction",
+        options: instructionLibrary.items.map((entry) => ({
+          title: `${entry.enabled ? "Enabled" : "Disabled"} · ${entry.title}`,
+          description: entry.mode === "always" ? "Always-active" : "Slash-triggered",
+          value: entry.id,
+        })),
+      })
+      if (!item) return
+      let enabled = false
+      await updateInstructionLibrary((draft) => {
+        const entry = draft.items.find((candidate) => candidate.id === item)
+        if (!entry) return
+        entry.enabled = !entry.enabled
+        enabled = entry.enabled
+      })
+      context.ui.toast.show({ variant: "info", message: `${enabled ? "Enabled" : "Disabled"} instruction.` })
+    }
+
+    const deleteInstruction = async () => {
+      const item = await context.ui.dialog.select({
+        title: "Delete an instruction",
+        options: instructionLibrary.items.map((entry) => ({ title: entry.title, description: entry.prompt, value: entry.id })),
+      })
+      if (!item) return
+      const entry = instructionLibrary.items.find((candidate) => candidate.id === item)
+      if (!entry) return
+      const confirmed = await context.ui.dialog.confirm({
+        title: "Delete instruction?",
+        message: `Delete “${entry.title}” from your instruction library? Existing sessions keep their saved copy.`,
+      })
+      if (!confirmed) return
+      await updateInstructionLibrary((draft) => {
+        draft.items = draft.items.filter((candidate) => candidate.id !== item)
+      })
+      context.ui.toast.show({ variant: "success", message: `Deleted instruction: ${entry.title}` })
+    }
+
+    const generateSummary = async (sessionID: string, automatic = false): Promise<void> => {
+      if (context.data.session.status(sessionID) === "running") return
+      const session = context.data.session.get(sessionID)
+      if (!session) return
+      const existing = summaryState.entries[sessionID]
+      if (automatic && existing && existing.sourceUpdatedAt >= session.time.updated) return
+      setSummaryStatus("working")
+      bump()
+      try {
+        await context.data.session.message.sync(sessionID)
+        const messages = context.data.session.message.list(sessionID) ?? []
+        const transcript = summaryTranscript(messages as Array<{ type?: string; text?: string; content?: Array<{ type?: string; text?: string }> }>)
+        if (!transcript.trim()) throw new Error("This session has no conversation text to summarize.")
+        const sourceUpdatedAt = context.data.session.get(sessionID)?.time.updated ?? session.time.updated
+        const model = context.ui.model.current()
+        const result = await context.client.generate.text({
+          prompt: summaryPrompt(session.title ?? "Untitled session", transcript),
+          model: model ? { id: model.modelID, providerID: model.providerID } : undefined,
+        })
+        const entry: SessionSummary = {
+          sessionID,
+          projectID: session.projectID,
+          title: session.title ?? "Untitled session",
+          summary: result.text.trim(),
+          updatedAt: Date.now(),
+          sourceUpdatedAt,
+        }
+        await updateSummaryState((draft) => {
+          draft.entries[sessionID] = entry
+        })
+        setSummaryStatus("done")
+        bump()
+        if (!automatic) {
+          context.ui.dialog.set({ size: "large" })
+          context.ui.dialog.show(() => (
+            <box flexDirection="column" paddingLeft={2} paddingRight={2} gap={1}>
+              <text>{entry.title}</text>
+              <text>{entry.summary}</text>
+            </box>
+          ))
+        }
+      } catch (error) {
+        setSummaryStatus("failed")
+        context.ui.toast.show({
+          variant: "error",
+          title: "Session summary failed",
+          message: error instanceof Error ? error.message : String(error),
+        })
+      } finally {
+        bump()
+      }
+    }
+
+    const idleTimers = new Map<string, ReturnType<typeof setTimeout>>()
+    const cancelSummaryTimer = (sessionID: string) => {
+      const timer = idleTimers.get(sessionID)
+      if (timer) clearTimeout(timer)
+      idleTimers.delete(sessionID)
+    }
+    const scheduleIdleSummary = (sessionID: string) => {
+      cancelSummaryTimer(sessionID)
+      const timer = setTimeout(() => {
+        idleTimers.delete(sessionID)
+        if (context.data.session.status(sessionID) === "idle") void generateSummary(sessionID, true)
+      }, 5 * 60_000)
+      idleTimers.set(sessionID, timer)
+    }
+
+    type MCPConnection = { name: string; status: { status: string; error?: string } }
+    type MCPRetry = { attempt: number; timer?: ReturnType<typeof setTimeout> }
+    const MCP_RETRY_DELAYS = [2_000, 5_000, 15_000]
+    const mcpRetries = new Map<string, MCPRetry>()
+    const mcpExhausted = new Set<string>()
+    let mcpRecoveryDisposed = false
+    const mcpLocation = context.location?.directory ? { directory: context.location.directory } : undefined
+    const listMCPConnections = async (): Promise<MCPConnection[]> => {
+      const result = await context.client.mcp.list({ location: mcpLocation })
+      return result.data as MCPConnection[]
+    }
+    const clearMCPRetry = (name: string) => {
+      const retry = mcpRetries.get(name)
+      if (retry?.timer) clearTimeout(retry.timer)
+      mcpRetries.delete(name)
+      setMcpRecoveryCount(mcpRetries.size)
+    }
+    const scheduleMCPRetry = (name: string) => {
+      if (mcpRecoveryDisposed || mcpExhausted.has(name)) return
+      const retry = mcpRetries.get(name) ?? { attempt: 0 }
+      if (retry.attempt >= MCP_RETRY_DELAYS.length) {
+        clearMCPRetry(name)
+        mcpExhausted.add(name)
+        context.ui.toast.show({
+          variant: "warning",
+          title: `MCP ${name} did not reconnect`,
+          message: "Automatic retries stopped. Reconnect it from /mcp when ready.",
+        })
+        return
+      }
+      if (retry.timer) return
+      retry.timer = setTimeout(() => {
+        retry.timer = undefined
+        void (async () => {
+          try {
+            const before = (await listMCPConnections()).find((server) => server.name === name)
+            if (!before || before.status.status !== "failed") {
+              if (before?.status.status !== "pending") clearMCPRetry(name)
+              return
+            }
+            retry.attempt += 1
+            try {
+              await context.client.mcp.connect({ server: name, location: mcpLocation })
+            } catch {
+              // Inspect the server's current state below; a connect failure is
+              // expected while a remote service is still recovering.
+            }
+            const after = (await listMCPConnections()).find((server) => server.name === name)
+            if (after?.status.status === "connected") {
+              mcpExhausted.delete(name)
+              clearMCPRetry(name)
+              context.ui.toast.show({ variant: "success", title: `MCP ${name} reconnected`, message: "The server is ready to use." })
+              return
+            }
+            if (after?.status.status === "failed") {
+              scheduleMCPRetry(name)
+              return
+            }
+            if (after?.status.status !== "pending") clearMCPRetry(name)
+          } catch {
+            retry.attempt += 1
+            scheduleMCPRetry(name)
+          }
+        })()
+      }, MCP_RETRY_DELAYS[retry.attempt])
+      mcpRetries.set(name, retry)
+      setMcpRecoveryCount(mcpRetries.size)
+    }
+    const handleMCPStatus = async (name: string) => {
+      if (mcpRecoveryDisposed) return
+      const server = (await listMCPConnections()).find((entry) => entry.name === name)
+      switch (server?.status.status) {
+        case "failed":
+          scheduleMCPRetry(name)
+          break
+        case "pending": {
+          // A retry itself passes through pending. Keep its attempt counter
+          // across that transition so repeated failures reach the circuit
+          // breaker instead of restarting forever at the first delay.
+          const retry = mcpRetries.get(name)
+          if (retry?.timer) {
+            clearTimeout(retry.timer)
+            retry.timer = undefined
+          }
+          break
+        }
+        case "connected":
+        case "disabled":
+        case "needs_auth":
+        case undefined:
+          mcpExhausted.delete(name)
+          clearMCPRetry(name)
+          break
+      }
+    }
+    if (startup.type === "session") {
+      void seedMeter(startup.sessionID)
+    }
+    void listMCPConnections()
+      .then((servers) => servers.filter((server) => server.status.status === "failed").forEach((server) => scheduleMCPRetry(server.name)))
+      .catch((error) => console.warn("opencode-status-line: could not inspect MCP connections", error))
 
     /** What the session record carries for the usage line, read defensively. */
     interface SessionUsage {
@@ -843,10 +1390,406 @@ export default Plugin.define({
                 context.ui.dialog.show(() => <Stats sessionID={sessionID} />)
               },
             },
+            {
+              id: "opencode-status-line.summary",
+              title: "Session: summarize current session",
+              group: "opencode-status-line",
+              palette: true,
+              slash: { name: "summary" },
+              run: () => {
+                const sessionID = currentSession()
+                if (sessionID) void generateSummary(sessionID)
+                else context.ui.toast.show({ variant: "warning", message: "Open a session before creating a summary." })
+              },
+            },
+            {
+              id: "opencode-status-line.instructions",
+              title: "Session: choose always-active instructions",
+              group: "opencode-status-line",
+              palette: true,
+              slash: { name: "instructions" },
+              run: () => openInstructionPicker("always"),
+            },
+            {
+              id: "opencode-status-line.instruction.once",
+              title: "Session: trigger instruction for next prompt",
+              group: "opencode-status-line",
+              palette: true,
+              slash: { name: "instruction" },
+              run: () => openInstructionPicker("slash"),
+            },
+            {
+              id: "opencode-status-line.instruction.add",
+              title: "Instructions: add to library",
+              group: "opencode-status-line",
+              palette: true,
+              slash: { name: "instruction-add" },
+              run: () => void addInstruction(),
+            },
+            {
+              id: "opencode-status-line.instruction.toggle",
+              title: "Instructions: enable or disable",
+              group: "opencode-status-line",
+              palette: true,
+              slash: { name: "instruction-toggle" },
+              run: () => void toggleInstruction(),
+            },
+            {
+              id: "opencode-status-line.instruction.delete",
+              title: "Instructions: delete from library",
+              group: "opencode-status-line",
+              palette: true,
+              slash: { name: "instruction-delete" },
+              run: () => void deleteInstruction(),
+            },
+            {
+              id: "opencode-status-line.project-terminal",
+              title: "Project: open PowerShell",
+              group: "opencode-status-line",
+              palette: true,
+              slash: { name: "terminal" },
+              run: () => openProjectPowerShell(),
+            },
+            {
+              id: "opencode-status-line.summaries",
+              title: "Session: browse saved summaries",
+              group: "opencode-status-line",
+              palette: true,
+              slash: { name: "summaries" },
+              run: async () => {
+                const entries = Object.values(summaryState.entries)
+                const active = currentSession()
+                const activeProject = active ? context.data.session.get(active)?.projectID : undefined
+                const projectEntries = entries.filter((entry) => entry.projectID === activeProject)
+                if (!entries.length) {
+                  context.ui.toast.show({ variant: "info", message: "No saved summaries yet. Use /summary first." })
+                  return
+                }
+                const scope = projectEntries.length
+                  ? await context.ui.dialog.select({
+                      title: "Choose summary scope",
+                      options: [
+                        { title: "Current project", description: `${projectEntries.length} summaries`, value: "project" },
+                        { title: "All projects", description: `${entries.length} summaries`, value: "all" },
+                      ],
+                    current: "project",
+                    })
+                  : "all"
+                if (!scope) return
+                if (!active) {
+                  context.ui.toast.show({ variant: "warning", message: "Open a session before attaching summaries." })
+                  return
+                }
+                const activeInfo = context.data.session.get(active)
+                const metadata = activeInfo?.metadata as Record<string, unknown> | undefined
+                const rawAttachments = metadata?.[SUMMARY_ATTACHMENT_METADATA_KEY]
+                const priorAttachments = Array.isArray(rawAttachments)
+                  ? rawAttachments.filter((value): value is SummaryAttachment => {
+                      if (!value || typeof value !== "object") return false
+                      const item = value as Record<string, unknown>
+                      return (
+                        typeof item.sessionID === "string" &&
+                        typeof item.projectID === "string" &&
+                        typeof item.title === "string" &&
+                        typeof item.summary === "string" &&
+                        typeof item.updatedAt === "number"
+                      )
+                    })
+                  : []
+                const priorSummaries: SessionSummary[] = priorAttachments.map((entry) =>
+                  summaryState.entries[entry.sessionID] ?? { ...entry, sourceUpdatedAt: entry.updatedAt },
+                )
+                const candidateIDs = new Set((scope === "project" ? projectEntries : entries).map((entry) => entry.sessionID))
+                const candidates = [...(scope === "project" ? projectEntries : entries), ...priorSummaries.filter((entry) => !candidateIDs.has(entry.sessionID))]
+                  .slice()
+                  .sort((left, right) => right.updatedAt - left.updatedAt)
+                setSelectedSummaryIDs(priorAttachments.map((entry) => entry.sessionID))
+                setSummaryPickerCursor(0)
+                setSummaryPicker({ sessionID: active, entries: candidates })
+                context.ui.dialog.set({ size: "xlarge" })
+                context.ui.dialog.show(() => <SummaryPicker />)
+              },
+            },
+          ],
+        }))
+        context.keymap.layer(() => ({
+          mode: "modal",
+          enabled: () => Boolean(summaryPicker() || instructionPicker()),
+          priority: 100,
+          commands: [
+            {
+              id: "opencode-status-line.summaries.up",
+              title: "Picker: previous item",
+              bind: "up",
+              run: () => {
+                try {
+                  setSummaryPickerCursor((index) => Math.max(0, index - 1))
+                  if (summaryPicker()) summaryDetailScroll?.scrollTo(0)
+                } catch (error) {
+                  console.warn("opencode-status-line: summary picker navigation failed", error)
+                }
+              },
+            },
+            {
+              id: "opencode-status-line.summaries.down",
+              title: "Picker: next item",
+              bind: "down",
+              run: () => {
+                try {
+                  const count = summaryPicker()?.entries.length ?? instructionPicker()?.entries.length ?? 1
+                  setSummaryPickerCursor((index) => Math.min(count - 1, index + 1))
+                  if (summaryPicker()) summaryDetailScroll?.scrollTo(0)
+                } catch (error) {
+                  console.warn("opencode-status-line: summary picker navigation failed", error)
+                }
+              },
+            },
+            {
+              id: "opencode-status-line.summaries.toggle",
+              title: "Picker: toggle selection",
+              bind: "space",
+              run: () => {
+                try {
+                  if (summaryPicker()) {
+                    const entry = summaryPicker()?.entries[summaryPickerCursor()]
+                    if (!entry) return
+                    setSelectedSummaryIDs((selected) =>
+                      selected.includes(entry.sessionID)
+                        ? selected.filter((id) => id !== entry.sessionID)
+                        : [...selected, entry.sessionID],
+                    )
+                  } else {
+                    const entry = instructionPicker()?.entries[summaryPickerCursor()]
+                    if (!entry) return
+                    setSelectedInstructionIDs((selected) =>
+                      selected.includes(entry.id) ? selected.filter((id) => id !== entry.id) : [...selected, entry.id],
+                    )
+                  }
+                } catch (error) {
+                  console.warn("opencode-status-line: summary selection failed", error)
+                }
+              },
+            },
+            {
+              id: "opencode-status-line.summaries.detail.pageup",
+              title: "Summary details: scroll up",
+              bind: "pageup",
+              enabled: () => Boolean(summaryPicker()),
+              run: () => summaryDetailScroll?.scrollBy(-12),
+            },
+            {
+              id: "opencode-status-line.summaries.detail.pagedown",
+              title: "Summary details: scroll down",
+              bind: "pagedown",
+              enabled: () => Boolean(summaryPicker()),
+              run: () => summaryDetailScroll?.scrollBy(12),
+            },
+            {
+              id: "opencode-status-line.summaries.attach",
+              title: "Picker: apply selection",
+              bind: "enter",
+              run: () => {
+                const attach = instructionPicker() ? attachInstructionSelection : attachSummarySelection
+                void attach().catch((error) => {
+                  context.ui.toast.show({
+                    variant: "error",
+                    title: "Could not apply selection",
+                    message: error instanceof Error ? error.message : String(error),
+                  })
+                })
+              },
+            },
+            {
+              id: "opencode-status-line.summaries.cancel",
+              title: "Picker: close",
+              bind: "escape",
+              run: () => {
+                try {
+                  setSummaryPicker(undefined)
+                  setInstructionPicker(undefined)
+                  context.ui.dialog.clear()
+                } catch (error) {
+                  console.warn("opencode-status-line: could not close summary picker", error)
+                }
+              },
+            },
           ],
         }))
         return null
       },
+    })
+
+    const sidebarSession = () => {
+      const sessionID = currentSession()
+      const session = sessionID ? context.data.session.get(sessionID) : undefined
+      return { sessionID, metadata: (session?.metadata ?? {}) as Record<string, unknown> }
+    }
+    const refreshToolInventory = async () => {
+      if (toolInventoryLoading()) return
+      setToolInventoryLoading(true)
+      setToolInventoryError(false)
+      try {
+        const directory = sidebarSession().sessionID
+          ? context.data.session.get(sidebarSession().sessionID!)?.location.directory
+          : context.location?.directory ?? context.data.location.default()?.directory
+        const result = await context.client.rpc.call({
+          rpcID: TOOL_INVENTORY_RPC.id,
+          method: "list",
+          input: {},
+          location: directory ? { directory } : undefined,
+        })
+        const raw = (result as { data?: { output?: unknown }; output?: unknown }).data?.output ?? (result as { output?: unknown }).output
+        if (!raw || typeof raw !== "object") throw new Error("Tool inventory response was empty")
+        const value = raw as Partial<ToolInventory>
+        if (!Array.isArray(value.tools) || typeof value.estimatedTokens !== "number") throw new Error("Tool inventory response was invalid")
+        setToolInventory(value as ToolInventory)
+      } catch (error) {
+        setToolInventoryError(true)
+        console.warn("opencode-status-line: could not load tool inventory", error)
+      } finally {
+        setToolInventoryLoading(false)
+      }
+    }
+    const showToolInventory = async () => {
+      await refreshToolInventory()
+      const inventory = toolInventory()
+      if (!inventory) {
+        context.ui.toast.show({ variant: "warning", message: "Tool inventory is unavailable. Check that the companion server plugin is loaded." })
+        return
+      }
+      const model = context.ui.model.current()
+      const limit = contextLimit(model ? { id: model.modelID, providerID: model.providerID } : undefined)
+      const percentage = limit ? ` (~${(inventory.estimatedTokens / limit * 100).toFixed(1)}% of selected model context)` : " (model context limit unavailable)"
+      context.ui.dialog.set({ size: "large" })
+      context.ui.dialog.show(() => (
+        <box flexDirection="column" paddingLeft={2} paddingRight={2} gap={1}>
+          <text>{`Registered tools: ${inventory.tools.length} | ~${inventory.estimatedTokens.toLocaleString()} tokens${percentage}`}</text>
+          <text>Combined inventory from built-in, plugin, and MCP tools. Token count is a character-based estimate, not exact prompt usage or MCP-only usage.</text>
+          <For each={inventory.tools.slice(0, 80)}>
+            {(tool) => <text wrapMode="word">{`${tool.id} (~${tool.estimatedTokens} tokens)${tool.description ? ` — ${tool.description}` : ""}`}</text>}
+          </For>
+          <Show when={inventory.tools.length > 80}><text>{`Showing 80 of ${inventory.tools.length} tools.`}</text></Show>
+        </box>
+      ))
+    }
+    void refreshToolInventory()
+    const toggleSidebarSummary = async (entry: SessionSummary) => {
+      const { sessionID, metadata } = sidebarSession()
+      if (!sessionID) {
+        context.ui.toast.show({ variant: "warning", message: "Open a session before attaching a summary." })
+        return
+      }
+      const activeInfo = context.data.session.get(sessionID)
+      if (!activeInfo) return
+      const raw = metadata[SUMMARY_ATTACHMENT_METADATA_KEY]
+      const attached = Array.isArray(raw) ? raw.filter((value): value is SummaryAttachment => {
+        if (!value || typeof value !== "object") return false
+        const item = value as Record<string, unknown>
+        return typeof item.sessionID === "string" && typeof item.projectID === "string" && typeof item.title === "string" && typeof item.summary === "string" && typeof item.updatedAt === "number"
+      }) : []
+      const exists = attached.some((item) => item.sessionID === entry.sessionID)
+      const next = exists
+        ? attached.filter((item) => item.sessionID !== entry.sessionID)
+        : [...attached, { sessionID: entry.sessionID, projectID: entry.projectID, title: entry.title, summary: entry.summary, updatedAt: entry.updatedAt }]
+      await context.client.session.update({ sessionID, metadata: { ...activeInfo.metadata, [SUMMARY_ATTACHMENT_METADATA_KEY]: next } })
+      context.ui.toast.show({ variant: "info", message: exists ? `Detached summary: ${entry.title}` : `Attached summary: ${entry.title}` })
+    }
+    const toggleSidebarInstruction = async (entry: UserInstruction) => {
+      const { sessionID, metadata } = sidebarSession()
+      if (!sessionID) {
+        context.ui.toast.show({ variant: "warning", message: "Open a session before selecting instructions." })
+        return
+      }
+      const activeInfo = context.data.session.get(sessionID)
+      if (!activeInfo) return
+      const key = entry.mode === "always" ? SESSION_INSTRUCTIONS_METADATA_KEY : PENDING_INSTRUCTIONS_METADATA_KEY
+      const selected = validInstructionSnapshots(metadata[key])
+      const exists = selected.some((item) => item.id === entry.id)
+      const next = exists ? selected.filter((item) => item.id !== entry.id) : [...selected, { id: entry.id, title: entry.title, prompt: entry.prompt, mode: entry.mode }]
+      await context.client.session.update({ sessionID, metadata: { ...activeInfo.metadata, [key]: next } })
+      context.ui.toast.show({ variant: "info", message: exists ? `Removed instruction: ${entry.title}` : `Selected instruction: ${entry.title}` })
+    }
+
+    context.ui.slot({
+      append: "sidebar.content",
+      render: () => {
+        const session = sidebarSession()
+        const rawAttachments = session.metadata[SUMMARY_ATTACHMENT_METADATA_KEY]
+        const attachments: SummaryAttachment[] = Array.isArray(rawAttachments)
+          ? rawAttachments.filter((value): value is SummaryAttachment => {
+              if (!value || typeof value !== "object") return false
+              const item = value as Record<string, unknown>
+              return typeof item.sessionID === "string" && typeof item.projectID === "string" && typeof item.title === "string" && typeof item.summary === "string" && typeof item.updatedAt === "number"
+            })
+          : []
+        const sessionInstructions = validInstructionSnapshots(session.metadata[SESSION_INSTRUCTIONS_METADATA_KEY])
+        const pendingInstructions = validInstructionSnapshots(session.metadata[PENDING_INSTRUCTIONS_METADATA_KEY])
+        const enabledItems = instructionLibrary.items.filter((item) => item.enabled)
+        const visibleInstructions = [...instructionLibrary.items.filter((item) =>
+          item.enabled || sessionInstructions.some((selected) => selected.id === item.id) || pendingInstructions.some((selected) => selected.id === item.id),
+        )]
+        const projectID = session.sessionID ? context.data.session.get(session.sessionID)?.projectID : undefined
+        const visibleSummaries = Object.values(summaryState.entries)
+          .filter((entry) => !projectID || entry.projectID === projectID)
+          .sort((left, right) => right.updatedAt - left.updatedAt)
+        const selectedModel = context.ui.model.current()
+        const modelLimit = contextLimit(selectedModel ? { id: selectedModel.modelID, providerID: selectedModel.providerID } : undefined)
+        const toolPercent = toolInventory() && modelLimit
+          ? ` (~${(toolInventory()!.estimatedTokens / modelLimit * 100).toFixed(1)}%)`
+          : ""
+        return (
+          <box flexDirection="column" gap={1}>
+            <text wrapMode="none" onMouseUp={safely(() => void showToolInventory())}>
+              Tools ({toolInventoryLoading() ? "…" : toolInventory()?.tools.length ?? "?"}){toolInventory() ? ` | ~${toolInventory()!.estimatedTokens.toLocaleString()} tokens${toolPercent}` : toolInventoryError() ? " | unavailable" : " | inspect"}
+            </text>
+            <box flexDirection="column">
+              <text wrapMode="none" onMouseUp={() => setSummarySectionOpen((open) => !open)}>
+                {summarySectionOpen() ? "[-]" : "[+]"} Summaries ({visibleSummaries.length}){summaryStatusText() ? ` | ${summaryStatusText()}` : ""}
+              </text>
+              <Show when={summarySectionOpen()}>
+                <Show when={visibleSummaries.length > 0} fallback={<text>No saved summaries yet. Use /summary.</text>}>
+                  <For each={visibleSummaries}>
+                    {(entry) => (
+                      <text wrapMode="none" onMouseUp={safely(() => void toggleSidebarSummary(entry))}>
+                        {attachments.some((item) => item.sessionID === entry.sessionID) ? "  [x] " : "  [ ] "}{entry.title}
+                      </text>
+                    )}
+                  </For>
+                </Show>
+                <text wrapMode="none" onMouseUp={safely(() => {
+                  const sessionID = currentSession()
+                  if (sessionID) void generateSummary(sessionID)
+                })}>+ Summarize this session</text>
+              </Show>
+            </box>
+            <box flexDirection="column">
+              <text wrapMode="none" onMouseUp={() => setInstructionSectionOpen((open) => !open)}>
+                {instructionSectionOpen() ? "[-]" : "[+]"} Instructions ({enabledItems.length} enabled)
+              </text>
+              <Show when={instructionSectionOpen()}>
+                <Show when={visibleInstructions.length > 0} fallback={<text wrapMode="none">No saved instructions</text>}>
+                  <For each={visibleInstructions}>
+                    {(entry) => {
+                      const selected = () => (entry.mode === "always" ? sessionInstructions : pendingInstructions).some((item) => item.id === entry.id)
+                      return (
+                        <text wrapMode="none" onMouseUp={safely(() => void toggleSidebarInstruction(entry))}>
+                          {selected() ? "  [x] " : "  [ ] "}{entry.mode === "always" ? "Always" : "Once"} - {entry.title}
+                        </text>
+                      )
+                    }}
+                  </For>
+                </Show>
+                <text wrapMode="none" onMouseUp={safely(() => openInstructionPicker("always"))}>Choose session</text>
+                <text wrapMode="none" onMouseUp={safely(() => openInstructionPicker("slash"))}>Queue next prompt</text>
+              </Show>
+            </box>
+          </box>
+        )
+      },
+    })
+    context.ui.slot({
+      append: "sidebar.footer",
+      render: () => <text wrapMode="none" onMouseUp={safely(() => openProjectPowerShell())}>PowerShell</text>,
     })
 
     /** One drawn row: the plain runs, a run that takes clicks, then the rest. */
@@ -1116,6 +2059,11 @@ export default Plugin.define({
       for (const stop of stops) stop()
       if (timer) clearInterval(timer)
       clearInterval(heartbeat)
+      for (const idleTimer of idleTimers.values()) clearTimeout(idleTimer)
+      idleTimers.clear()
+      mcpRecoveryDisposed = true
+      for (const retry of mcpRetries.values()) if (retry.timer) clearTimeout(retry.timer)
+      mcpRetries.clear()
     }
   },
 })
