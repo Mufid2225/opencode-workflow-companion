@@ -18,9 +18,9 @@ introduction; `MANUAL.md` is the exhaustive user reference.
 
 ## Shape
 
-- `src/tui.tsx` is the plugin entry, the only file importing `@opencode/plugin`,
-  `solid-js` or host APIs; the checkout loads it as TSX, npm consumers get the
-  built `dist/tui.js`.
+- `src/tui.tsx` is the TUI entry and `src/plugin.ts` is the server entry. The
+  checkout loads `tui.tsx` and `server-plugin/`; npm consumers get
+  `dist/tui.js` and `dist/plugin.js`.
 - Keep `/** @jsxImportSource @opentui/solid */` as its first line.
 - The root `tui.tsx` is a load-bearing shim re-exporting `src/tui.tsx`; keep it.
 - Keep new logic in the pure modules (`src/rate.ts`, `render.ts`, `format.ts`,

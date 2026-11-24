@@ -1,27 +1,31 @@
 {
   "name": "@rashidrazak/opencode-status-line",
   "version": "1.2.0",
-  "description": "A live status line for OpenCode v2's terminal UI — context window, cache, streaming speed, cost, elapsed time and uncommitted changes in one configurable row.",
+  "description": "An OpenCode v2 workflow plugin with a configurable status line, session summaries and instructions, MCP recovery, project terminal shortcut, and tool inventory.",
   "type": "module",
   "license": "MIT",
   "author": "Rashid Razak <bib.nexus@gmail.com>",
-  "homepage": "https://github.com/rashidrazak/opencode-status-line#readme",
+  "homepage": "https://github.com/Mufid2225/opencode-status-line#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/rashidrazak/opencode-status-line.git"
+    "url": "git+https://github.com/Mufid2225/opencode-status-line.git"
   },
   "bugs": {
-    "url": "https://github.com/rashidrazak/opencode-status-line/issues"
+    "url": "https://github.com/Mufid2225/opencode-status-line/issues"
   },
   "keywords": [
     "opencode",
     "opencode-plugin",
     "tui",
+    "session-summary",
+    "mcp",
+    "workflow",
     "statusline",
     "status-line"
   ],
   "exports": {
-    "./tui": "./dist/tui.js"
+    "./tui": "./dist/tui.js",
+    "./plugin": "./dist/plugin.js"
   },
   "files": [
     "src",

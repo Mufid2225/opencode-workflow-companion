@@ -8,6 +8,29 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Session summaries.** `/summary` creates a persistent Indonesian summary of
+  the current conversation, `/summaries` browses saved summaries, and the
+  sidebar can trigger a refresh. An idle session is summarized after
+  five minutes without new agent activity.
+- **MCP recovery.** Failed MCP servers receive up to three asynchronous
+  reconnect attempts with increasing delays. Disabled servers and servers
+  waiting for authentication are left alone; exhausted retries show a toast.
+- **Project terminal shortcut.** `/terminal` and the sidebar action open a
+  PowerShell window in the active project's directory.
+- **Session instruction library.** Instructions persist across projects and
+  can be selected for a session or triggered for one prompt. Selected
+  instructions are passed to subagents; `/instruction-add`,
+  `/instruction-toggle`, and `/instruction-delete` manage the library.
+- **Registered tool inventory.** A sidebar row shows tool count and an
+  approximate schema-token footprint as a share of the selected model's
+  context. Click it to inspect names and descriptions. The inventory combines
+  built-in, plugin, and MCP tools; it cannot attribute tools to an MCP server.
+- **Server companion entry.** The package now exposes a server plugin for
+  prompt context and tool inventory RPC. Checkout installs use the
+  `server-plugin` directory as the server entry.
+
 ## [1.2.0] - 2026-10-04
 
 ### Changed

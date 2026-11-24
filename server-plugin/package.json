@@ -1,0 +1,6 @@
+{
+  "name": "opencode-status-line-server-plugin",
+  "private": true,
+  "type": "module",
+  "main": "./index.ts"
+}

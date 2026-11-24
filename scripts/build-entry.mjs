@@ -34,7 +34,7 @@ const FORBIDDEN = ["@opentui/solid/jsx-runtime", "@opentui/solid/jsx-dev-runtime
 await rm("dist", { recursive: true, force: true })
 
 const result = await Bun.build({
-  entrypoints: ["src/tui.tsx"],
+  entrypoints: ["src/tui.tsx", "src/plugin.ts"],
   outdir: "dist",
   target: "bun",
   format: "esm",

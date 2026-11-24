@@ -1,8 +1,8 @@
 # opencode-status-line — Customization Manual
 
 This is the complete reference for the plugin: every setting, palette and
-behaviour. It assumes you already have the plugin loaded in OpenCode's CLI —
-the [README](README.md) covers install and the short version.
+workflow feature. The [README](README.md) covers checkout installation and the
+short version.
 
 If you are new here, read [Quick start](#2-quick-start) first. Then jump to
 the part you care about:
@@ -16,6 +16,16 @@ the part you care about:
 7. [The context bar](#7-the-context-bar)
 8. [The uncommitted changes counter](#8-the-uncommitted-changes-counter)
 9. [The stats dialog](#9-the-stats-dialog)
+
+### Workflow features
+
+- [Session summaries](#session-summaries)
+- [Session instructions](#session-instructions)
+- [MCP recovery](#mcp-recovery)
+- [Tool inventory](#tool-inventory)
+- [Project PowerShell](#project-powershell)
+- [Install both plugin entries from a checkout](#install-both-plugin-entries-from-a-checkout)
+
 10. [All settings at a glance](#10-all-settings-at-a-glance)
 11. [Ready-made setups](#11-ready-made-setups)
 12. [Common questions and fixes](#12-common-questions-and-fixes)
@@ -103,27 +113,31 @@ and draws a wider speed gauge. The next sections explain every key you can use.
 
 ### Install reminder
 
-The plugin is CLI-only, so it goes in `~/.config/opencode/cli.json`, not
-`opencode.json`:
+This fork is installed from a checkout. Clone it, run `bun install`, then add
+the checkout's TUI entry to `~/.config/opencode/cli.json`:
 
 ```json
 {
-  "plugins": ["@rashidrazak/opencode-status-line"]
+  "plugins": ["C:/path/to/opencode-status-line/src"]
 }
 ```
 
-OpenCode downloads the published package and runs its prebuilt entry; there is
-nothing to compile on your side.
-
-From a checkout, point at the folder instead — an absolute path or a path
-relative to the config folder both work. OpenCode then transpiles the source
-itself, so a saved edit reloads the plugin in place:
+To include selected summaries and instructions in prompts and pass them to
+subagents, and to enable the tool inventory, load the server companion in the
+`plugin` list in `opencode.json`:
 
 ```json
 {
-  "plugins": ["/path/to/opencode-status-line"]
+  "plugin": ["C:/path/to/opencode-status-line/server-plugin"]
 }
 ```
+
+Keep the entries in their respective files: `cli.json` for the TUI and
+`opencode.json` for the server companion. Without the server entry, summaries
+and instructions can still be created and browsed, but selected context is not
+injected into prompts, and the tool inventory is unavailable. See
+[Install both plugin entries from a checkout](#install-both-plugin-entries-from-a-checkout)
+for the complete setup.
 
 ---
 
@@ -616,6 +630,117 @@ the live figure prefers, so a tool-heavy turn does not read lower after a
 restart. The meter segment is not blank after the restart; the live `↯` figure
 returns with the next stream.
 
+## Session summaries
+
+Run `/summary` to summarize the current session. The summary records the
+session goal, completed work, status, current work and next steps. It is stored
+in OpenCode's durable plugin storage, so it remains available if the source
+session is later deleted. The summary request runs asynchronously and does not
+add a message to the conversation.
+
+The plugin also refreshes the current session's summary after five minutes of
+idle time. New agent activity cancels that timer. Use **Summaries** in the
+sidebar to generate or refresh a summary at any time.
+
+Run `/summaries` to choose prior summaries to attach to this session. The list
+defaults to the current project and offers all projects as another scope. Use
+the arrow keys to focus an entry; the focused entry expands to show its full
+summary while the others stay on one line. Space toggles selection, Enter
+attaches the selected summaries, and Esc leaves without changing the session.
+The selected summary text is stored in this session's metadata and added to
+future prompts; the server companion also passes it to child agents. Unselected
+summaries are not added to prompts. Attaching a prior summary does not replace
+or modify the active session's own summary.
+
+## Session instructions
+
+Use `/instruction-add` to save a titled instruction in the plugin's durable
+library. Choose whether it is always-active or triggered for one prompt. The
+library is shared across projects and persists when OpenCode restarts.
+
+- `/instructions` opens the picker for instructions that apply to every prompt
+  in the current session.
+- `/instruction` opens the picker for instructions queued for the next prompt.
+- `/instruction-toggle` enables or disables a library entry for future
+  selection without deleting it.
+- `/instruction-delete` removes an entry from the library. Copies already
+  attached to a session remain in that session until unselected.
+
+In either picker, use arrow keys to focus an item, Space to select or deselect,
+Enter to apply, and Esc to cancel. Always-active selections remain attached to
+the session. Queued selections clear after the next agent turn finishes.
+Applying an empty selection clears the corresponding session instructions.
+The server companion adds selected instructions to prompts and passes them to
+child agents. Instructions do not apply to sessions where they were not
+selected.
+
+## MCP recovery
+
+When an MCP server reports a temporary failure, the plugin tries to reconnect
+up to three times, waiting 2, 5, then 15 seconds between attempts. This runs in
+the background and does not pause prompting. A recovered server shows a
+success toast; after the final failure, a warning toast points to `/mcp` for a
+manual reconnect. Servers marked disabled or needs-auth are never retried.
+
+## Tool inventory
+
+The **Tools** row appears in the right sidebar under the MCP list. It displays
+the number of currently registered tools, an estimated schema-token count, and
+the estimate as a percentage of the selected model's context limit. Click the
+row to refresh the inventory and open a dialog with tool names and
+descriptions. The dialog lists up to 80 entries.
+
+The inventory comes from the server companion's plugin RPC and includes tools
+registered by OpenCode, plugins, and MCP servers. OpenCode v2.2.7 does not
+provide a supported mapping from every registered tool to its MCP server, so
+the list cannot report per-server counts or token shares.
+
+The token count is a rough estimate based on the serialized tool name,
+description, and input schema (characters divided by four). Actual tokenization
+depends on the model and OpenCode's prompt serialization. The percentage uses
+the selected model's declared context limit when available; it is not a
+measurement of actual prompt usage. If the selected model does not declare a
+context limit, the percentage is omitted.
+
+If the row says `unavailable`, check that the server companion is configured in
+`opencode.json`, then restart OpenCode. The TUI entry in `cli.json` alone does
+not provide the server RPC.
+
+## Project PowerShell
+
+Run `/terminal` or click **PowerShell** in the sidebar footer to open a new
+PowerShell window in the active session's project directory. When no session is
+open, it uses the TUI's current project directory. The window is independent
+of OpenCode, so long-running commands continue while you switch back to the
+TUI; close the PowerShell window to stop them. This shortcut currently targets
+Windows PowerShell.
+
+## Install both plugin entries from a checkout
+
+For a checkout install, configure the TUI and server entries separately. In
+`~/.config/opencode/cli.json`, point `plugins` at the checkout's `src`
+directory:
+
+```json
+{
+  "plugins": ["C:/path/to/opencode-status-line/src"]
+}
+```
+
+In `~/.config/opencode/opencode.json`, point `plugin` at the companion
+directory:
+
+```json
+{
+  "plugin": ["C:/path/to/opencode-status-line/server-plugin"]
+}
+```
+
+Merge these entries into existing arrays instead of replacing other plugins.
+The server path must name a directory; `server-plugin` contains the entry
+wrapper for `src/plugin.ts`. Restart OpenCode after changing either config.
+For the full setup, see the README's [Install](README.md#install) section.
+
 ---
 
 ## 10. All settings at a glance
@@ -912,6 +1037,6 @@ its slots. A host that cannot draw the line at all would exhaust that table and
 take the whole TUI down with it, so the plugin stops drawing instead, warns
 once, and stays quiet until it is reloaded. Restart OpenCode. If the line
 returns and then disappears again, please
-[open an issue](https://github.com/rashidrazak/opencode-status-line/issues):
+[open an issue](https://github.com/Mufid2225/opencode-status-line/issues):
 it means the plugin and the host are not sharing a TUI runtime, and that is
 worth fixing rather than living with.
